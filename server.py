@@ -5,25 +5,36 @@ import threading
 import queue
 import time
 import sounddevice as sd
-
+import json
+import asyncio
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-import asyncio
-import json
 
 # --- Конфігурація ---
-MODEL_PATH   = 'keyword_v2.tflite'
-NORM_MEAN    = 0.7796
-NORM_STD     = 0.1989
-COMMANDS     = ['noise', 'marvin', 'go', 'stop', 'left', 'right', 'yes', 'no']
-SAMPLE_RATE  = 16000
-STEP_SAMPLES = int(SAMPLE_RATE * 0.2)
-VOTE_WINDOW  = 5
-COOLDOWN_SEC = 1.0
+MODEL_PATH     = 'audio_encoder_v3.tflite'
+CENTROIDS_PATH = 'centroids.npy'
+STDS_PATH      = 'stds.npy'
 
-confidence_thresholds = np.array([0.8, 0.9, 0.75, 0.92, 0.92, 0.85, 0.9, 0.75], dtype=np.float32)
+NORM_MEAN      = 0.7796
+NORM_STD       = 0.1989
+COMMANDS       = ['noise', 'marvin', 'go', 'stop', 'left', 'right', 'yes', 'no', 'unrecognized']
+SAMPLE_RATE    = 16000
+STEP_SAMPLES   = int(SAMPLE_RATE * 0.2) 
+COOLDOWN_SEC   = 0.7 
+MARGIN_THRESHOLD = 0.1 # Мінімальна різниця між 1-м та 2-м кандидатом
 
-# --- Модель ---
+# --- Завантаження центроїдів ---
+centroids_dict = np.load(CENTROIDS_PATH, allow_pickle=True).item()
+stds_dict = np.load(STDS_PATH, allow_pickle=True).item()
+
+centroid_matrix = np.array([centroids_dict[i] for i in range(9)])
+stds_vector = np.array([stds_dict[i] for i in range(9)])
+
+# Розрахунок жорсткого ліміту (Hard Limit)
+# Можна взяти як центроїд + 3.5 сигми або заздалегідь розрахований макс.
+max_allowed_dists = stds_vector * 2.5
+
+# --- Ініціалізація TFLite ---
 interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
 interpreter.allocate_tensors()
 input_details  = interpreter.get_input_details()
@@ -40,169 +51,122 @@ def audio_to_melspec(audio):
     mel_norm = tf.image.resize(mel_norm[tf.newaxis, :, :, tf.newaxis], [64, 128])[0, :, :, 0]
     return mel_norm.numpy()
 
-def predict(spec):
+def get_embedding(spec):
     spec = spec[np.newaxis, :, :, np.newaxis].astype(np.float32)
     interpreter.set_tensor(input_details[0]['index'], spec)
     interpreter.invoke()
     return interpreter.get_tensor(output_details[0]['index'])[0]
 
-# --- Стан програми ---
 class ListenerState:
     def __init__(self):
         self.is_listening = False
         self.audio_queue  = queue.Queue()
         self.audio_buffer = collections.deque(maxlen=SAMPLE_RATE)
-        self.vote_buffer  = collections.deque(maxlen=VOTE_WINDOW)
         self.last_trigger = 0.0
         self.stream       = None
         self.thread       = None
-        # SSE subscribers: list of asyncio.Queue
-        self.subscribers: list[asyncio.Queue] = []
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self.subscribers  = []
+        self._loop        = None
 
-    def set_loop(self, loop):
-        self._loop = loop
+    def set_loop(self, loop): self._loop = loop
 
     def broadcast(self, event: dict):
-        """Push event to all SSE subscribers (thread-safe)."""
-        if self._loop is None:
-            return
+        if self._loop is None: return
         data = json.dumps(event, ensure_ascii=False)
         for q in self.subscribers:
             self._loop.call_soon_threadsafe(q.put_nowait, data)
 
 state = ListenerState()
 
-# --- Аудіо-колбек ---
 def audio_callback(indata, frames, time_info, status):
-    if status:
-        print(status)
     state.audio_queue.put(indata[:, 0].copy())
 
-# --- Цикл передбачення ---
 def predict_loop():
     samples_since_last_step = 0
     state.audio_buffer.clear()
-    state.vote_buffer.clear()
-    state.last_trigger = 0.0
 
     while state.is_listening:
         try:
             chunk = state.audio_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
+        except queue.Empty: continue
 
         state.audio_buffer.extend(chunk)
         samples_since_last_step += len(chunk)
 
-        if samples_since_last_step < STEP_SAMPLES:
-            continue
+        if samples_since_last_step < STEP_SAMPLES: continue
         samples_since_last_step = 0
+        
+        if len(state.audio_buffer) < SAMPLE_RATE: continue
 
-        if len(state.audio_buffer) < SAMPLE_RATE:
-            continue
+        # Аналіз поточного вікна (без усереднення векторів)
+        window = np.array(state.audio_buffer, dtype=np.float32)
+        spec = (audio_to_melspec(window) - NORM_MEAN) / (NORM_STD + 1e-7)
+        emb = get_embedding(spec)
 
-        window   = np.array(state.audio_buffer, dtype=np.float32)
-        spec     = audio_to_melspec(window)
-        spec     = (spec - NORM_MEAN) / (NORM_STD + 1e-7)
-        raw_pred = predict(spec)
-        state.vote_buffer.append(raw_pred)
+        # 1. Рахуємо відстані до всіх центроїдів
+        dists = np.linalg.norm(centroid_matrix - emb, axis=1)
+        
+        # Знаходимо два найближчих класи для перевірки Margin
+        sorted_indices = np.argsort(dists)
+        best_idx = int(sorted_indices[0])
+        second_best_idx = int(sorted_indices[1])
+        
+        min_dist = dists[best_idx]
+        margin = dists[second_best_idx] - min_dist
+        
+        now = time.time()
 
-        if len(state.vote_buffer) == VOTE_WINDOW:
-            mean_probs = np.mean(state.vote_buffer, axis=0)
-            pred_class = int(np.argmax(mean_probs))
-            conf       = mean_probs[pred_class] / np.linalg.norm(mean_probs)
-            now        = time.time()
-
-            if conf >= confidence_thresholds[pred_class] and pred_class != 0:
+        # 2. Жорстка фільтрація
+        # Клас 0 (noise) та 8 (unrecognized) не тригерять події
+        if best_idx not in [0, 8]:
+            # Перевірка на входження в радіус + Margin Rejection
+            if min_dist <= max_allowed_dists[best_idx] and margin > MARGIN_THRESHOLD:
+                
                 if (now - state.last_trigger) > COOLDOWN_SEC:
-                    label = COMMANDS[pred_class]
-                    ts    = time.strftime('%H:%M:%S')
-                    print(f"[{ts}] >>> Впізнано: {label} ({conf:.0%})")
+                    label = COMMANDS[best_idx]
                     state.last_trigger = now
-                    state.vote_buffer.clear()
+                    
+                    print(f"[{time.strftime('%H:%M:%S')}] 🎯 TRIGGER: {label.upper()} (dist: {min_dist:.3f}, margin: {margin:.3f})")
+                    
                     state.broadcast({
                         "type": "keyword",
                         "keyword": label,
-                        "confidence": round(float(conf), 4),
-                        "timestamp": ts,
+                        "distance": round(float(min_dist), 4),
+                        "margin": round(float(margin), 4)
                     })
 
-# --- FastAPI ---
-app = FastAPI(title="Keyword Spotting API")
+# --- FastAPI Setup ---
+app = FastAPI()
 
 @app.on_event("startup")
-async def startup():
-    state.set_loop(asyncio.get_event_loop())
+async def startup(): state.set_loop(asyncio.get_event_loop())
 
 @app.post("/start")
-def start_listening():
-    if state.is_listening:
-        return {"status": "already_listening"}
-
+def start():
+    if state.is_listening: return {"status": "ok"}
     state.is_listening = True
-    # Drain stale audio
-    while not state.audio_queue.empty():
-        state.audio_queue.get_nowait()
-
-    state.stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        blocksize=STEP_SAMPLES,
-        callback=audio_callback,
-    )
+    state.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, blocksize=STEP_SAMPLES, callback=audio_callback)
     state.stream.start()
-
     state.thread = threading.Thread(target=predict_loop, daemon=True)
     state.thread.start()
-
-    print("Listening started.")
     return {"status": "started"}
 
 @app.post("/stop")
-def stop_listening():
-    if not state.is_listening:
-        return {"status": "not_listening"}
-
+def stop():
     state.is_listening = False
-
-    if state.stream:
-        state.stream.stop()
-        state.stream.close()
-        state.stream = None
-
-    if state.thread:
-        state.thread.join(timeout=2)
-        state.thread = None
-
-    print("Listening stopped.")
+    if state.stream: state.stream.stop(); state.stream.close()
     return {"status": "stopped"}
-
-@app.get("/status")
-def get_status():
-    return {"is_listening": state.is_listening}
 
 @app.get("/events")
 async def sse_events():
-    """Server-Sent Events stream — pushes keyword detections to the client."""
-    q: asyncio.Queue = asyncio.Queue()
-    state.subscribers.append(q)
-
-    async def event_generator():
+    q = asyncio.Queue(); state.subscribers.append(q)
+    async def gen():
         try:
-            # Send an initial ping so the client knows we're connected
             yield "data: {\"type\": \"connected\"}\n\n"
-            while True:
-                data = await q.get()
-                yield f"data: {data}\n\n"
-        except asyncio.CancelledError:
-            pass
-        finally:
-            state.subscribers.remove(q)
+            while True: yield f"data: {await q.get()}\n\n"
+        finally: state.subscribers.remove(q)
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-# --- Точка входу ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
