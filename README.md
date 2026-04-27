@@ -158,15 +158,16 @@ Using these techniques, it was possible to acquire the following results on test
 unrecognized       0.94      0.63      0.76       869
 
     accuracy                           0.82      6306
-   macro avg       0.90      0.83      0.85      6306
-weighted avg       0.90      0.82      0.84      6306
+    macro avg      0.90      0.83      0.85      6306
+    weighted avg   0.90      0.82      0.84      6306
 
-![img5](image-6.png)
+![img5 ](image-6.png)
 
 Model architecture is almost the same since higher dilation doesn't increase the number of parameters.
 
 They are a bit worse than the previous results, yet the model, in fact, works better, recognizing words better and distinguishing between them. Low noise precision for noise is expected — unrecognized speech now falls into noise class by design, acting as a rejection mechanism.
 
-![Demo Video](video_2026-04-27_15-32-15.mp4)
+<video src="video_2026-04-27_15-32-15.mp4" controls="controls" style="max-width: 100%;">
+</video>
 
 
